@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from gurobipy import Model, GRB, quicksum
+from ortools.linear_solver import pywraplp
 
 # =========================================================
 # STREAMLIT AYARLARI
@@ -87,56 +87,104 @@ d = {
 BIG_M = sum(t.values())
 
 # =========================================================
-# MODEL
+# MODEL ÇÖZÜM FONKSİYONU
 # =========================================================
 def solve_model():
 
-    m = Model("assembly_line")
-    m.setParam("OutputFlag", 0)
+    solver = pywraplp.Solver.CreateSolver("SCIP")
 
-    # Karar değişkenleri
-    x = m.addVars(I, J, vtype=GRB.BINARY, name="x")
-    y = m.addVars(W, J, vtype=GRB.BINARY, name="y")
-    z = m.addVars(W, vtype=GRB.BINARY, name="z")
+    if not solver:
+        st.error("Solver oluşturulamadı.")
+        return None
 
-    l = m.addVars(J, lb=0, vtype=GRB.CONTINUOUS, name="l")
-    q = m.addVars(W, J, lb=0, vtype=GRB.CONTINUOUS, name="q")
-    U = m.addVars(W, lb=0, vtype=GRB.CONTINUOUS, name="U")
+    # =====================================================
+    # KARAR DEĞİŞKENLERİ
+    # =====================================================
+    x = {}
+    y = {}
+    z = {}
+    l = {}
+    q = {}
+    U = {}
 
-    C = m.addVar(lb=0, vtype=GRB.CONTINUOUS, name="C")
+    # x[i,j]
+    for i in I:
+        for j in J:
+            x[i, j] = solver.BoolVar(f"x_{i}_{j}")
+
+    # y[w,j]
+    for w in W:
+        for j in J:
+            y[w, j] = solver.BoolVar(f"y_{w}_{j}")
+
+    # z[w]
+    for w in W:
+        z[w] = solver.BoolVar(f"z_{w}")
+
+    # l[j]
+    for j in J:
+        l[j] = solver.NumVar(0, solver.infinity(), f"l_{j}")
+
+    # q[w,j]
+    for w in W:
+        for j in J:
+            q[w, j] = solver.NumVar(
+                0,
+                solver.infinity(),
+                f"q_{w}_{j}"
+            )
+
+    # U[w]
+    for w in W:
+        U[w] = solver.NumVar(
+            0,
+            solver.infinity(),
+            f"U_{w}"
+        )
+
+    # C
+    C = solver.NumVar(
+        0,
+        solver.infinity(),
+        "C"
+    )
 
     # =====================================================
     # 1) Her operasyon bir istasyona atanır
     # =====================================================
     for i in I:
-        m.addConstr(
-            quicksum(x[i, j] for j in J) == 1
+        solver.Add(
+            sum(x[i, j] for j in J) == 1
         )
 
     # =====================================================
     # 2) Öncelik ilişkileri
     # =====================================================
     for i, h in P:
-        m.addConstr(
-            quicksum(j * x[i, j] for j in J)
+
+        solver.Add(
+            sum(j * x[i, j] for j in J)
             <=
-            quicksum(j * x[h, j] for j in J)
+            sum(j * x[h, j] for j in J)
         )
 
     # =====================================================
     # 3) İstasyon yükü
     # =====================================================
     for j in J:
-        m.addConstr(
-            l[j] == quicksum(t[i] * x[i, j] for i in I)
+
+        solver.Add(
+            l[j] ==
+            sum(t[i] * x[i, j] for i in I)
         )
 
     # =====================================================
-    # 4) Her istasyona 1 operatör
+    # 4) Her istasyona bir operatör
     # =====================================================
     for j in J:
-        m.addConstr(
-            quicksum(y[w, j] for w in W) == 1
+
+        solver.Add(
+            sum(y[w, j] for w in W) == 1
         )
 
     # =====================================================
@@ -144,7 +192,8 @@ def solve_model():
     # =====================================================
     for w in W:
         for j in J:
-            m.addConstr(
+
+            solver.Add(
                 y[w, j] <= z[w]
             )
 
@@ -154,29 +203,32 @@ def solve_model():
     for w in W:
         for j in J:
 
-            m.addConstr(q[w, j] <= l[j])
+            solver.Add(q[w, j] <= l[j])
 
-            m.addConstr(
+            solver.Add(
                 q[w, j] <= BIG_M * y[w, j]
             )
 
-            m.addConstr(
-                q[w, j] >= l[j] - BIG_M * (1 - y[w, j])
+            solver.Add(
+                q[w, j] >=
+                l[j] - BIG_M * (1 - y[w, j])
             )
 
     # =====================================================
     # 7) Operatör yükü <= çevrim süresi
     # =====================================================
     for w in W:
-        m.addConstr(
-            quicksum(q[w, j] for j in J) <= C
+
+        solver.Add(
+            sum(q[w, j] for j in J) <= C
         )
 
     # =====================================================
     # 8) İstasyon yükü <= çevrim süresi
     # =====================================================
     for j in J:
-        m.addConstr(
+
+        solver.Add(
             l[j] <= C
         )
 
@@ -185,12 +237,13 @@ def solve_model():
     # =====================================================
     for w in W:
 
-        m.addConstr(
-            U[w] == (D / T) * quicksum(q[w, j] for j in J)
+        solver.Add(
+            U[w] ==
+            (D / T) *
+            sum(q[w, j] for j in J)
         )
 
-        # KRİTİK KISIT
-        m.addConstr(
+        solver.Add(
             U[w] <= U_MAX
         )
 
@@ -203,53 +256,72 @@ def solve_model():
 
                 if j < k and d[j][k] > L:
 
-                    m.addConstr(
+                    solver.Add(
                         y[w, j] + y[w, k] <= 1
                     )
 
     # =====================================================
     # 11) Operatör sayısı
     # =====================================================
-    m.addConstr(
-        quicksum(z[w] for w in W) == worker_count
+    solver.Add(
+        sum(z[w] for w in W)
+        == worker_count
     )
 
     # =====================================================
-    # AMAÇ
+    # AMAÇ FONKSİYONU
     # =====================================================
-    m.setObjective(C, GRB.MINIMIZE)
+    solver.Minimize(C)
 
     # =====================================================
     # ÇÖZ
     # =====================================================
-    m.optimize()
+    status = solver.Solve()
 
-    return m, x, y, z, l, q, U, C
+    return (
+        solver,
+        status,
+        x,
+        y,
+        z,
+        l,
+        q,
+        U,
+        C
+    )
 
 # =========================================================
-# ÇÖZÜM
+# MODELİ ÇÖZ
 # =========================================================
 if solve_button:
 
     with st.spinner("Model çözülüyor..."):
 
-        m, x, y, z, l, q, U, C = solve_model()
+        result = solve_model()
+
+    if result is None:
+        st.stop()
+
+    (
+        solver,
+        status,
+        x,
+        y,
+        z,
+        l,
+        q,
+        U,
+        C
+    ) = result
 
     # =====================================================
-    # FEASIBLE KONTROL
+    # ÇÖZÜM VAR MI?
     # =====================================================
-    if m.status == GRB.INFEASIBLE:
+    if status != pywraplp.Solver.OPTIMAL:
 
-        st.error("Model uygun çözüm bulamadı.")
+        st.error("Optimal çözüm bulunamadı.")
 
-        m.computeIIS()
-        m.write("infeasible.ilp")
-
-        st.warning(
-            "IIS dosyası oluşturuldu: infeasible.ilp"
-        )
-
-    elif m.status == GRB.OPTIMAL:
+    else:
 
         st.success("Optimal çözüm bulundu.")
 
@@ -257,27 +329,31 @@ if solve_button:
         # KPI
         # =================================================
         used_workers = sum(
-            int(round(z[w].X))
+            int(z[w].solution_value())
             for w in W
         )
 
-        reachable_output = T / C.X
+        reachable_output = T / C.solution_value()
 
         max_util = max(
-            100 * U[w].X
+            100 * U[w].solution_value()
             for w in W
         )
 
-        avg_util = sum(
-            100 * U[w].X
-            for w in W if z[w].X > 0.5
-        ) / used_workers
+        avg_util = (
+            sum(
+                100 * U[w].solution_value()
+                for w in W
+                if z[w].solution_value() > 0.5
+            )
+            / used_workers
+        )
 
         col1, col2, col3, col4 = st.columns(4)
 
         col1.metric(
             "Çevrim Süresi",
-            f"{C.X:.2f}"
+            f"{C.solution_value():.2f}"
         )
 
         col2.metric(
@@ -305,20 +381,23 @@ if solve_button:
             ops = []
 
             for i in I:
-                if x[i, j].X > 0.5:
+                if x[i, j].solution_value() > 0.5:
                     ops.append(i)
 
             assigned_worker = None
 
             for w in W:
-                if y[w, j].X > 0.5:
+                if y[w, j].solution_value() > 0.5:
                     assigned_worker = w
 
             station_data.append({
                 "İstasyon": j,
                 "Operasyonlar": str(ops),
                 "Operatör": assigned_worker,
-                "Yük": round(l[j].X, 2)
+                "Yük": round(
+                    l[j].solution_value(),
+                    2
+                )
             })
 
         df_station = pd.DataFrame(station_data)
@@ -337,16 +416,16 @@ if solve_button:
 
         for w in W:
 
-            if z[w].X > 0.5:
+            if z[w].solution_value() > 0.5:
 
                 stations = []
 
                 for j in J:
-                    if y[w, j].X > 0.5:
+                    if y[w, j].solution_value() > 0.5:
                         stations.append(j)
 
                 load = sum(
-                    q[w, j].X
+                    q[w, j].solution_value()
                     for j in J
                 )
 
@@ -355,7 +434,10 @@ if solve_button:
                     "İstasyonlar": str(stations),
                     "Ürün Başı Yük": round(load, 2),
                     "Vardiya Yükü": round(D * load, 2),
-                    "Doluluk (%)": round(100 * U[w].X, 2)
+                    "Doluluk (%)": round(
+                        100 * U[w].solution_value(),
+                        2
+                    )
                 })
 
         df_worker = pd.DataFrame(worker_data)
@@ -368,7 +450,7 @@ if solve_button:
         )
 
         # =================================================
-        # GRAFİK
+        # DOLULUK GRAFİĞİ
         # =================================================
         fig = px.bar(
             df_worker,
